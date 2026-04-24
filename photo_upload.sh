@@ -22,7 +22,7 @@ PHOTOS_ARCHIVE="$HOME/uploaded_archive/photos"
 GDRIVE_PHOTOS="$RCLONE_REMOTE:AutoUpload/photos_rpi"
 
 SCAN_INTERVAL=10       # seconds between scans
-MIN_AGE=5             # seconds — skip files newer than this (may still be writing)
+MIN_AGE=5              # seconds — skip files newer than this (may still be writing)
 
 LOG_FILE="$HOME/photo_upload.log"
 MAX_LOG_LINES=5000
@@ -51,25 +51,6 @@ is_old_enough() {
     [ "$age" -ge "$MIN_AGE" ]
 }
 
-upload_and_archive() {
-    local src_file="$1"
-    local filename
-    filename=$(basename "$src_file")
-
-    log "↑ Uploading: $filename"
-    if rclone copy "$src_file" "$GDRIVE_PHOTOS" \
-            --transfers 4 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --stats 0 \
-            --log-level ERROR 2>>"$LOG_FILE"; then
-        mv "$src_file" "$PHOTOS_ARCHIVE/$filename"
-        log "✔ Archived: $filename"
-    else
-        log "✖ Upload FAILED: $filename (will retry next cycle)"
-    fi
-}
-
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 mkdir -p "$PHOTOS_ARCHIVE"
@@ -93,15 +74,41 @@ fi
 while true; do
     rotate_log
 
-    uploaded=0
+    # Collect all ready files
+    ready_files=()
     while IFS= read -r -d '' f; do
         if is_old_enough "$f"; then
-            upload_and_archive "$f"
-            (( uploaded++ ))
+            ready_files+=("$f")
         fi
     done < <(find "$PHOTOS_DIR" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null)
 
-    [ "$uploaded" -eq 0 ] && log "No new photos."
+    if [ "${#ready_files[@]}" -eq 0 ]; then
+        log "No new photos."
+        sleep "$SCAN_INTERVAL"
+        continue
+    fi
+
+    log "↑ Uploading ${#ready_files[@]} photo(s) in parallel..."
+
+    # Upload all ready files in one rclone call (parallel via --transfers 10)
+    if rclone copy "$PHOTOS_DIR" "$GDRIVE_PHOTOS" \
+            --transfers 10 \
+            --no-traverse \
+            --files-from <(printf '%s\n' "${ready_files[@]}" | xargs -I{} basename {}) \
+            --retries 5 \
+            --low-level-retries 10 \
+            --stats 0 \
+            --log-level ERROR 2>>"$LOG_FILE"; then
+
+        # Move successfully uploaded files to archive
+        for f in "${ready_files[@]}"; do
+            filename=$(basename "$f")
+            mv "$f" "$PHOTOS_ARCHIVE/$filename"
+            log "✔ Archived: $filename"
+        done
+    else
+        log "✖ Batch upload had errors (will retry next cycle)."
+    fi
 
     sleep "$SCAN_INTERVAL"
 done
